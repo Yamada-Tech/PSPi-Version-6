@@ -4,7 +4,7 @@
 ##  Desc:  Installs RetroPie on PiOS Aarch64 for PSPi 6 with CM5 support.
 ##  Notes: Requires WiFi pre-configured in Raspberry Pi Imager and DPI overlay in /boot/firmware/config.txt.
 ##  Usage: ./install-retropie.sh [--help] [--dry-run] [--config <config_file>]
-##  Updated: Dynamic kernel version detection, robust error handling, user feedback, and log cleanup.
+##  Updated: Dynamic kernel version detection, robust error handling, user feedback, log cleanup, gzdoom fix, and skip failed cores.
 ################################################################################
 
 # Display help message
@@ -79,8 +79,7 @@ handle_failure() {
         echo "Run 'sudo apt install --reinstall raspi-firmware raspberrypi-kernel=1:$(uname -r) firmware-brcm80211' if issues persist." | tee -a "$LOG_FILE"
     fi
     echo "Installation failed at step: $step. Please check $LOG_FILE for details." | tee -a "$LOG_FILE"
-    echo "Press Enter to reboot or Ctrl+C to exit:" | tee -a "$LOG_FILE"
-    read -r
+    sleep 30
     if [ "$DRY_RUN" = false ]; then
         reboot
     else
@@ -234,21 +233,41 @@ fi
 # Install RetroPie cores
 CORES=$(grep -oP '^\s*"[^"]+"(?=\s*#|$)' "$CONFIG_FILE" | tr -d '"')
 for CORE in $CORES; do
+    if is_step_complete "failed_install_$CORE"; then
+        echo "Skipping previously failed core: $CORE" | tee -a "$LOG_FILE"
+        continue
+    fi
     if ! is_step_complete "install_$CORE"; then
         echo "Installing core $CORE..." | tee -a "$LOG_FILE"
         if [ "$CORE" = "gzdoom" ]; then
             if [ "$DRY_RUN" = false ]; then
-                apt install -y libzmusic1 < /dev/null 2>>"$LOG_FILE" || echo "Failed to install libzmusic1." >> "$LOG_FILE"
+                if /opt/RetroPie-Setup/retropie_packages.sh "$CORE"; then
+                    # Fix zmusic version mismatch by creating symlink
+                    cd /opt/retropie/ports/gzdoom || echo "Failed to cd to gzdoom directory." >> "$LOG_FILE"
+                    if [ -f "libzmusic.so.1.2.0" ] && [ ! -f "libzmusic.so.1.1.14" ]; then
+                        ln -s libzmusic.so.1.2.0 libzmusic.so.1.1.14 2>>"$LOG_FILE" || echo "Failed to create symlink for libzmusic." >> "$LOG_FILE"
+                    fi
+                    mark_step_complete "install_$CORE"
+                    CHANGES_MADE=true
+                else
+                    mark_step_complete "failed_install_$CORE"
+                    handle_failure "install_$CORE"
+                fi
             else
-                echo "[Dry-run] Would install libzmusic1 for gzdoom."
+                echo "[Dry-run] Would install gzdoom and create symlink for libzmusic.so.1.1.14."
             fi
-        fi
-        if [ "$DRY_RUN" = false ]; then
-            /opt/RetroPie-Setup/retropie_packages.sh "$CORE" || handle_failure "install_$CORE"
-            mark_step_complete "install_$CORE"
-            CHANGES_MADE=true
         else
-            echo "[Dry-run] Would install RetroPie core $CORE."
+            if [ "$DRY_RUN" = false ]; then
+                if /opt/RetroPie-Setup/retropie_packages.sh "$CORE"; then
+                    mark_step_complete "install_$CORE"
+                    CHANGES_MADE=true
+                else
+                    mark_step_complete "failed_install_$CORE"
+                    handle_failure "install_$CORE"
+                fi
+            else
+                echo "[Dry-run] Would install RetroPie core $CORE."
+            fi
         fi
     fi
 done
@@ -275,11 +294,11 @@ fi
 if [ "$CHANGES_MADE" = true ]; then
     echo "Installation complete. Reboot recommended." | tee -a "$LOG_FILE"
     if [ "$DRY_RUN" = false ]; then
-        dialog --msgbox "Installation complete. Press Enter to reboot or Ctrl+C to exit." 10 50
-        read -p "Press Enter to reboot or Ctrl+C to exit: "
+        dialog --msgbox "Installation complete. Rebooting in 30 seconds." 10 50
+        sleep 30
         reboot
     else
-        echo "[Dry-run] Would prompt for reboot."
+        echo "[Dry-run] Would reboot after 30 seconds."
     fi
 else
     echo "No changes made. Installation already complete." | tee -a "$LOG_FILE"
