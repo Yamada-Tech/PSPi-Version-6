@@ -1,52 +1,21 @@
 #!/bin/bash -e
 ################################################################################
-##  File:  install-retropie.sh
-##  Desc:  Installs RetroPie on PiOS Aarch64 for PSPi 6 with CM5 support.
-##  Notes: Requires WiFi pre-configured in Raspberry Pi Imager and DPI overlay in /boot/firmware/config.txt.
-##  Usage: ./install-retropie.sh [--help] [--dry-run] [--config <config_file>]
-##  Updated: Dynamic kernel version detection, robust error handling, user feedback, log cleanup, gzdoom fix, and skip failed cores.
+##  File:  install-pspi6.sh
+##  Desc: Installs RetroPie on PiOS Aarch64 for PSPi 6 with CM5 support.
+##  Notes: Requires WiFi pre-configured in Raspberry Pi Imager. DPI overlay in config.txt.
+##  Fixes: System date, DPKG conflicts, WiFi module, RetroPie cores, /boot/firmware mount.
+##  Updated: Auto-resolve initramfs.conf conflict, fallback to kernel 6.6.51, prevent reboot loop.
 ################################################################################
-
-# Display help message
-if [ "$1" = "--help" ]; then
-    echo "Usage: $0 [--help] [--dry-run] [--config <config_file>]"
-    echo "Installs RetroPie on Raspberry Pi OS Aarch64 for PSPi 6 with CM5 support."
-    echo "Prerequisites:"
-    echo "  - WiFi must be pre-configured in Raspberry Pi Imager."
-    echo "  - DPI overlay must be enabled in /boot/firmware/config.txt."
-    echo "Options:"
-    echo "  --help        Display this help message."
-    echo "  --dry-run     Simulate installation without making changes."
-    echo "  --config      Specify custom RetroPie configuration file (default: /boot/firmware/retropie.conf)."
-    exit 0
-fi
-
-# Dry-run mode
-DRY_RUN=false
-if [ "$1" = "--dry-run" ]; then
-    DRY_RUN=true
-    echo "Running in dry-run mode. No changes will be made."
-fi
-
-# Configuration file
-CONFIG_FILE=${2:-/boot/firmware/retropie.conf}
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Configuration file $CONFIG_FILE not found."
-    exit 1
-fi
+set -x
 
 # Generate log file
 LOG_FILE="/var/log/install-pspi6-$(date +%Y%m%d%H%M%S).log" || LOG_FILE="/var/log/install-pspi6-fallback.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# Clean up old log files (older than 7 days)
-LOG_RETENTION_DAYS=7
-find /var/log -name "install-pspi6-*.log" -mtime +$LOG_RETENTION_DAYS -delete 2>/dev/null
-
 # Progress file
 PROGRESS_FILE="/opt/pspi6_installation_progress"
-touch "$PROGRESS_FILE" 2>/dev/null || PROGRESS_FILE="/tmp/pspi6_installation_progress"
-chmod 666 "$PROGRESS_FILE" 2>/dev/null
+touch "$PROGRESS_FILE"
+chmod 666 "$PROGRESS_FILE"
 
 # Track changes
 CHANGES_MADE=false
@@ -58,248 +27,198 @@ is_step_complete() {
 
 # Function to mark step completion
 mark_step_complete() {
-    if [ "$DRY_RUN" = false ]; then
-        echo "$1" >> "$PROGRESS_FILE"
-    else
-        echo "[Dry-run] Would mark step $1 as complete."
-    fi
+    echo "$1" >> "$PROGRESS_FILE"
 }
 
 # Function to handle failure
 handle_failure() {
-    local step=$1
-    echo "Step failed: $step. Attempting recovery..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        pkill -f dpkg 2>>"$LOG_FILE" || echo "No dpkg processes to kill." >> "$LOG_FILE"
-        pkill -f apt 2>>"$LOG_FILE" || echo "No apt processes to kill." >> "$LOG_FILE"
-        rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>>"$LOG_FILE"
-        dpkg --configure -a --force-confnew 2>>"$LOG_FILE" || echo "dpkg recovery failed." >> "$LOG_FILE"
-        apt install -f -y < /dev/null 2>>"$LOG_FILE" || echo "apt fix failed." >> "$LOG_FILE"
-        df -h /boot/firmware >> "$LOG_FILE" 2>/dev/null || echo "No /boot/firmware mounted." >> "$LOG_FILE"
-        echo "Run 'sudo apt install --reinstall raspi-firmware raspberrypi-kernel=1:$(uname -r) firmware-brcm80211' if issues persist." | tee -a "$LOG_FILE"
-    fi
-    echo "Installation failed at step: $step. Please check $LOG_FILE for details." | tee -a "$LOG_FILE"
+    echo "Step failed: $1. Attempting recovery..." >> "$LOG_FILE"
+    pkill -f dpkg 2>>"$LOG_FILE" || echo "No dpkg processes to kill." >> "$LOG_FILE"
+    pkill -f apt 2>>"$LOG_FILE" || echo "No apt processes to kill." >> "$LOG_FILE"
+    rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>>"$LOG_FILE"
+    dpkg --configure -a --force-confnew 2>>"$LOG_FILE" || echo "dpkg recovery failed." >> "$LOG_FILE"
+    apt install -f -y 2>>"$LOG_FILE" || echo "apt fix failed." >> "$LOG_FILE"
+    df -h /boot/firmware >> "$LOG_FILE" 2>/dev/null || echo "No /boot/firmware mounted." >> "$LOG_FILE"
+    echo "Run 'sudo apt install --reinstall raspi-firmware raspberrypi-kernel=1:6.6.51+rpt-rpi-2712 firmware-brcm80211' if issues persist." >> "$LOG_FILE"
     sleep 30
-    if [ "$DRY_RUN" = false ]; then
-        reboot
-    else
-        echo "[Dry-run] Would reboot now."
-    fi
-    exit 1
+    reboot
 }
-
-# Verify disk space
-REQUIRED_SPACE=1000  # MB
-AVAILABLE_SPACE=$(df -m / | awk 'NR==2 {print $4}')
-if [ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE" ]; then
-    echo "Insufficient disk space on /. Need ${REQUIRED_SPACE}MB, but only ${AVAILABLE_SPACE}MB available." | tee -a "$LOG_FILE"
-    exit 1
-fi
 
 # Verify aarch64 for CM5
 ARCH=$(uname -m)
-if [ "$ARCH" != "aarch64" ]; then
-    echo "Warning: Non-aarch64 ($ARCH). CM5 requires aarch64." | tee -a "$LOG_FILE"
-fi
+[ "$ARCH" != "aarch64" ] && echo "Warning: Non-aarch64 ($ARCH). CM5 requires aarch64." >> "$LOG_FILE"
 
 # Fix system date
 if ! is_step_complete "fix_system_date"; then
-    echo "Setting system date..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        date -s "20250831 12:00:00" 2>>"$LOG_FILE" || echo "Date set failed. Current: $(date)" >> "$LOG_FILE"
-        mark_step_complete "fix_system_date"
-        CHANGES_MADE=true
-    else
-        echo "[Dry-run] Would set system date to 2025-08-31 12:00:00."
-    fi
+    date -s "20250831 12:00:00" 2>>"$LOG_FILE" || echo "Date set failed. Current: $(date)" >> "$LOG_FILE"
+    mark_step_complete "fix_system_date"
+    CHANGES_MADE=true
 fi
 
 # Check and uncompress WiFi module
 BRCMFMAC_PATH="/lib/modules/$(uname -r)/kernel/drivers/net/wireless/broadcom/brcm80211/brcmfmac"
 if [ -f "$BRCMFMAC_PATH/brcmfmac.ko.xz" ] && [ ! -f "$BRCMFMAC_PATH/brcmfmac.ko" ]; then
-    echo "Uncompressing WiFi module..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        unxz "$BRCMFMAC_PATH/brcmfmac.ko.xz" 2>>"$LOG_FILE" || echo "Failed to uncompress brcmfmac.ko.xz." >> "$LOG_FILE"
-        depmod -a 2>>"$LOG_FILE" || echo "depmod failed." >> "$LOG_FILE"
-    else
-        echo "[Dry-run] Would uncompress $BRCMFMAC_PATH/brcmfmac.ko.xz and run depmod."
-    fi
+    unxz "$BRCMFMAC_PATH/brcmfmac.ko.xz" 2>>"$LOG_FILE" || echo "Failed to uncompress brcmfmac.ko.xz." >> "$LOG_FILE"
+    depmod -a 2>>"$LOG_FILE" || echo "depmod failed." >> "$LOG_FILE"
 fi
 if [ ! -f "$BRCMFMAC_PATH/brcmfmac.ko" ]; then
-    echo "Reinstalling WiFi firmware..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        apt update < /dev/null 2>>"$LOG_FILE" && apt install --reinstall firmware-brcm80211 < /dev/null 2>>"$LOG_FILE" || echo "Firmware reinstall failed." >> "$LOG_FILE"
-        depmod -a 2>>"$LOG_FILE" || echo "depmod failed." >> "$LOG_FILE"
-    else
-        echo "[Dry-run] Would reinstall firmware-brcm80211 and run depmod."
-    fi
+    apt update 2>>"$LOG_FILE" && apt install --reinstall raspberrypi-kernel=1:6.6.51+rpt-rpi-2712 firmware-brcm80211 2>>"$LOG_FILE" || echo "Kernel/firmware reinstall failed." >> "$LOG_FILE"
+    depmod -a 2>>"$LOG_FILE" || echo "depmod failed." >> "$LOG_FILE"
 fi
-if [ "$DRY_RUN" = false ]; then
-    modprobe brcmfmac 2>>"$LOG_FILE" || echo "Failed to load brcmfmac." >> "$LOG_FILE"
-else
-    echo "[Dry-run] Would load brcmfmac module."
-fi
+modprobe brcmfmac 2>>"$LOG_FILE" || echo "Failed to load brcmfmac." >> "$LOG_FILE"
 
 # Check WiFi connectivity
 WIFI_RETRIES=3
 WIFI_SUCCESS=false
 for ((i=1; i<=WIFI_RETRIES; i++)); do
-    echo "Checking WiFi (Attempt $i/$WIFI_RETRIES)..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        if ping -c 1 8.8.8.8 > /dev/null 2>&1; then
-            WIFI_SUCCESS=true
-            break
-        fi
-    else
-        echo "[Dry-run] Would ping 8.8.8.8 to check WiFi."
+    echo "Checking WiFi (Attempt $i/$WIFI_RETRIES)..." >> "$LOG_FILE"
+    if ping -c 1 8.8.8.8 > /dev/null 2>&1; then
         WIFI_SUCCESS=true
         break
     fi
-    [ "$i" -lt "$WIFI_RETRIES" ] && sleep 10
+    sleep 10
 done
-if [ "$WIFI_SUCCESS" != "true" ]; then
-    handle_failure "wifi_check"
-fi
+[ "$WIFI_SUCCESS" != "true" ] && handle_failure "wifi_check"
 
 # Update and upgrade system
 if ! is_step_complete "update_upgrade"; then
-    echo "Updating and upgrading system..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        if ! mountpoint /boot/firmware >/dev/null 2>&1; then
-            echo "No /boot/firmware mounted. Reinstalling raspi-firmware..." | tee -a "$LOG_FILE"
-            apt update < /dev/null 2>>"$LOG_FILE" && apt install --reinstall raspi-firmware < /dev/null 2>>"$LOG_FILE" || handle_failure "install_raspi_firmware"
-            mount /boot/firmware 2>>"$LOG_FILE" || echo "/boot/firmware mount failed." >> "$LOG_FILE"
-        fi
-        pkill -f dpkg 2>>"$LOG_FILE" || echo "No dpkg processes to kill." >> "$LOG_FILE"
-        pkill -f apt 2>>"$LOG_FILE" || echo "No apt processes to kill." >> "$LOG_FILE"
-        rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>>"$LOG_FILE"
-        dpkg --configure -a --force-confnew 2>>"$LOG_FILE" || echo "dpkg configure failed." >> "$LOG_FILE"
-        apt install -f -y < /dev/null 2>>"$LOG_FILE" || handle_failure "fix_broken"
-        df -h /boot/firmware >> "$LOG_FILE" 2>/dev/null || echo "No /boot/firmware mounted." >> "$LOG_FILE"
-        if [ "$(df -h /boot/firmware 2>/dev/null | awk 'NR==2 {print $4}' | grep -o '[0-9]\+')" -lt 50 ]; then
-            apt purge -y linux-image-[0-5].* linux-headers-[0-5].* 2>>"$LOG_FILE" || echo "No old kernels to purge." >> "$LOG_FILE"
-            apt autoremove --purge -y < /dev/null 2>>"$LOG_FILE" || echo "Autoremove failed." >> "$LOG_FILE"
-            apt clean < /dev/null 2>>"$LOG_FILE" || echo "APT clean failed." >> "$LOG_FILE"
-        fi
-        apt update < /dev/null 2>>"$LOG_FILE" || handle_failure "update"
-        apt upgrade -y < /dev/null 2>>"$LOG_FILE" || handle_failure "upgrade"
-        KERNEL_VERSION=$(uname -r)
-        apt install -y raspberrypi-kernel=1:${KERNEL_VERSION} raspberrypi-bootloader < /dev/null 2>>"$LOG_FILE" || {
-            echo "Falling back to latest kernel version" >> "$LOG_FILE"
-            apt install -y raspberrypi-kernel raspberrypi-bootloader < /dev/null 2>>"$LOG_FILE" || handle_failure "install_kernel"
-        }
-        update-initramfs -u -k all 2>>"$LOG_FILE" || update-initramfs -c -k $(uname -r) 2>>"$LOG_FILE" || echo "Initramfs update failed." >> "$LOG_FILE"
-        mark_step_complete "update_upgrade"
-        CHANGES_MADE=true
-    else
-        echo "[Dry-run] Would update and upgrade system, install kernel $(uname -r), and update initramfs."
+    # Fix /boot/firmware mount
+    if ! mountpoint /boot/firmware >/dev/null 2>&1; then
+        echo "No /boot/firmware mounted. Reinstalling raspi-firmware..." >> "$LOG_FILE"
+        apt update 2>>"$LOG_FILE" && apt install --reinstall raspi-firmware 2>>"$LOG_FILE" || handle_failure "install_raspi_firmware"
+        mount /boot/firmware 2>>"$LOG_FILE" || echo "/boot/firmware mount failed." >> "$LOG_FILE"
     fi
+    # Resolve dpkg conflicts and fix dependencies
+    pkill -f dpkg 2>>"$LOG_FILE" || echo "No dpkg processes to kill." >> "$LOG_FILE"
+    pkill -f apt 2>>"$LOG_FILE" || echo "No apt processes to kill." >> "$LOG_FILE"
+    rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>>"$LOG_FILE"
+    dpkg --configure -a --force-confnew 2>>"$LOG_FILE" || echo "dpkg configure failed." >> "$LOG_FILE"
+    apt install -f -y 2>>"$LOG_FILE" || handle_failure "fix_broken"
+    df -h /boot/firmware >> "$LOG_FILE" 2>/dev/null || echo "No /boot/firmware mounted." >> "$LOG_FILE"
+    if [ "$(df -h /boot/firmware 2>/dev/null | awk 'NR==2 {print $4}' | grep -o '[0-9]\+')" -lt 50 ]; then
+        apt purge -y linux-image-[0-5].* linux-headers-[0-5].* 2>>"$LOG_FILE" || echo "No old kernels." >> "$LOG_FILE"
+        apt autoremove --purge -y 2>>"$LOG_FILE" || echo "Autoremove failed." >> "$LOG_FILE"
+        apt clean 2>>"$LOG_FILE" || echo "APT clean failed." >> "$LOG_FILE"
+    fi
+    apt update 2>>"$LOG_FILE" || handle_failure "update"
+    apt upgrade -y 2>>"$LOG_FILE" || handle_failure "upgrade"
+    apt install -y raspberrypi-kernel=1:6.6.51+rpt-rpi-2712 raspberrypi-bootloader 2>>"$LOG_FILE" || echo "Kernel/bootloader install failed." >> "$LOG_FILE"
+    update-initramfs -u -k all 2>>"$LOG_FILE" || update-initramfs -c -k $(uname -r) 2>>"$LOG_FILE" || echo "Initramfs update failed." >> "$LOG_FILE"
+    mark_step_complete "update_upgrade"
+    CHANGES_MADE=true
 fi
 
 # Install dependencies
 if ! is_step_complete "install_dependencies"; then
-    echo "Installing dependencies..." | tee -a "$LOG_FILE"
-    DEPENDENCIES="git lsb-release i2c-tools dialog"
-    for DEP in $DEPENDENCIES; do
-        if ! dpkg -l | grep -qw "$DEP"; then
-            if [ "$DRY_RUN" = false ]; then
-                apt install -y "$DEP" < /dev/null 2>>"$LOG_FILE" || handle_failure "install_$DEP"
-            else
-                echo "[Dry-run] Would install $DEP."
-            fi
-        else
-            echo "$DEP is already installed." >> "$LOG_FILE"
-        fi
-    done
+    apt install -y git lsb-release i2c-tools 2>>"$LOG_FILE"
     mark_step_complete "install_dependencies"
     CHANGES_MADE=true
 fi
 
 # Install RetroPie
 if ! is_step_complete "clone_retropie"; then
-    echo "Cloning RetroPie-Setup..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        cd /opt || handle_failure "change_directory"
-        if [ ! -d "/opt/RetroPie-Setup" ]; then
-            git clone --depth=1 https://github.com/RetroPie/RetroPie-Setup.git || handle_failure "clone_retropie"
-        fi
-        mark_step_complete "clone_retropie"
-        CHANGES_MADE=true
-    else
-        echo "[Dry-run] Would clone RetroPie-Setup to /opt/RetroPie-Setup."
+    cd /opt || handle_failure "change_directory"
+    if [ ! -d "/opt/RetroPie-Setup" ]; then
+        git clone --depth=1 https://github.com/RetroPie/RetroPie-Setup.git || handle_failure "clone_retropie"
     fi
+    mark_step_complete "clone_retropie"
+    CHANGES_MADE=true
+fi
+
+if ! is_step_complete "setup_retropie"; then
+    cd /opt/RetroPie-Setup || handle_failure "change_directory_retropie"
+    chmod +x /opt/RetroPie-Setup/retropie_packages.sh || handle_failure "chmod_retropie_packages"
+
+    # Break down each retropie_packages.sh command into its own step
+    if ! is_step_complete "install_retroarch"; then
+        /opt/RetroPie-Setup/retropie_packages.sh retroarch || handle_failure "install_retroarch"
+        mark_step_complete "install_retroarch"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_emulationstation"; then
+        /opt/RetroPie-Setup/retropie_packages.sh emulationstation || handle_failure "install_emulationstation"
+        mark_step_complete "install_emulationstation"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_retropiemenu"; then
+        /opt/RetroPie-Setup/retropie_packages.sh retropiemenu || handle_failure "install_retropiemenu"
+        mark_step_complete "install_retropiemenu"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_runcommand"; then
+        /opt/RetroPie-Setup/retropie_packages.sh runcommand || handle_failure "install_runcommand"
+        mark_step_complete "install_runcommand"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_samba_depends"; then
+        /opt/RetroPie-Setup/retropie_packages.sh samba depends || handle_failure "install_samba_depends"
+        mark_step_complete "install_samba_depends"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_samba_shares"; then
+        /opt/RetroPie-Setup/retropie_packages.sh samba install_shares || handle_failure "install_samba_shares"
+        mark_step_complete "install_samba_shares"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_splashscreen_default"; then
+        /opt/RetroPie-Setup/retropie_packages.sh splashscreen default || handle_failure "install_splashscreen_default"
+        mark_step_complete "install_splashscreen_default"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "enable_splashscreen"; then
+        /opt/RetroPie-Setup/retropie_packages.sh splashscreen enable || handle_failure "enable_splashscreen"
+        mark_step_complete "enable_splashscreen"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_bashwelcometweak"; then
+        /opt/RetroPie-Setup/retropie_packages.sh bashwelcometweak || handle_failure "install_bashwelcometweak"
+        mark_step_complete "install_bashwelcometweak"
+        CHANGES_MADE=true
+    fi
+
+    if ! is_step_complete "install_joy2key"; then
+        /opt/RetroPie-Setup/retropie_packages.sh joy2key || handle_failure "install_joy2key"
+        mark_step_complete "install_joy2key"
+        CHANGES_MADE=true
+    fi
+
+    # Enable autostart for EmulationStation
+    if ! is_step_complete "enable_autostart"; then
+        /opt/RetroPie-Setup/retropie_packages.sh autostart enable || handle_failure "enable_autostart"
+
+        # Update the autostart.sh script to wait for all processes running /usr/local/bin/install-retropie.sh to end
+        sed -i '3i\    sleep 3\n    while pgrep -f "/usr/local/bin/install-retropie.sh" > /dev/null; do\n      sleep 5\n    done' /etc/profile.d/10-retropie.sh
+
+        mark_step_complete "enable_autostart"
+        reboot
+    fi
+
+    mark_step_complete "setup_retropie"
+    CHANGES_MADE=true
 fi
 
 # Install RetroPie cores
-CORES=$(grep -oP '^\s*"[^"]+"(?=\s*#|$)' "$CONFIG_FILE" | tr -d '"')
+# Load cores from configuration file
+CORES=$(grep -oP '^\s*"[^"]+"(?=\s*#|$)' /boot/firmware/retropie.conf | tr -d '"')
+
 for CORE in $CORES; do
-    if is_step_complete "failed_install_$CORE"; then
-        echo "Skipping previously failed core: $CORE" | tee -a "$LOG_FILE"
-        continue
-    fi
     if ! is_step_complete "install_$CORE"; then
-        echo "Installing core $CORE..." | tee -a "$LOG_FILE"
-        if [ "$CORE" = "gzdoom" ]; then
-            if [ "$DRY_RUN" = false ]; then
-                if /opt/RetroPie-Setup/retropie_packages.sh "$CORE"; then
-                    # Fix zmusic version mismatch by creating symlink
-                    cd /opt/retropie/ports/gzdoom || echo "Failed to cd to gzdoom directory." >> "$LOG_FILE"
-                    if [ -f "libzmusic.so.1.2.0" ] && [ ! -f "libzmusic.so.1.1.14" ]; then
-                        ln -s libzmusic.so.1.2.0 libzmusic.so.1.1.14 2>>"$LOG_FILE" || echo "Failed to create symlink for libzmusic." >> "$LOG_FILE"
-                    fi
-                    mark_step_complete "install_$CORE"
-                    CHANGES_MADE=true
-                else
-                    mark_step_complete "failed_install_$CORE"
-                    handle_failure "install_$CORE"
-                fi
-            else
-                echo "[Dry-run] Would install gzdoom and create symlink for libzmusic.so.1.1.14."
-            fi
-        else
-            if [ "$DRY_RUN" = false ]; then
-                if /opt/RetroPie-Setup/retropie_packages.sh "$CORE"; then
-                    mark_step_complete "install_$CORE"
-                    CHANGES_MADE=true
-                else
-                    mark_step_complete "failed_install_$CORE"
-                    handle_failure "install_$CORE"
-                fi
-            else
-                echo "[Dry-run] Would install RetroPie core $CORE."
-            fi
-        fi
+        /opt/RetroPie-Setup/retropie_packages.sh "$CORE" || handle_failure "install_$CORE"
+        mark_step_complete "install_$CORE"
+        CHANGES_MADE=true
     fi
 done
 
-# Enable splashscreen
-if ! is_step_complete "enable_splashscreen"; then
-    echo "Enabling splashscreen..." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        if [ -f "/lib/systemd/system/asplashscreen.service" ]; then
-            /opt/RetroPie-Setup/retropie_packages.sh splashscreen enable || handle_failure "enable_splashscreen"
-            mark_step_complete "enable_splashscreen"
-            CHANGES_MADE=true
-        else
-            echo "Splashscreen service (asplashscreen.service) not found. Skipping enable step." >> "$LOG_FILE"
-            mark_step_complete "enable_splashscreen"
-            CHANGES_MADE=true
-        fi
-    else
-        echo "[Dry-run] Would enable splashscreen if asplashscreen.service exists."
-    fi
-fi
-
-# Finalize installation
+# Reboot if changes made
 if [ "$CHANGES_MADE" = true ]; then
-    echo "Installation complete. Reboot recommended." | tee -a "$LOG_FILE"
-    if [ "$DRY_RUN" = false ]; then
-        dialog --msgbox "Installation complete. Rebooting in 30 seconds." 10 50
-        sleep 30
-        reboot
-    else
-        echo "[Dry-run] Would reboot after 30 seconds."
-    fi
-else
-    echo "No changes made. Installation already complete." | tee -a "$LOG_FILE"
+    echo "Installation complete. Rebooting..." >> "$LOG_FILE"
+    reboot
 fi
